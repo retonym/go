@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import PagedAttentionCache
+import contextlib
 import torch
 model_id = "meta-llama/Llama-2-7b-hf"
 from torch._inductor import config as inductor_config
@@ -7,10 +8,11 @@ inductor_config.profiler_mark_wrapper_call = True
 inductor_config.cpp.enable_kernel_profile = True
 inductor_config.cpp_wrapper = True
 # inductor_config.max_autotune = True
-attn_type = "paged_attention"
+# attn_type = "paged_attention"
+attn_type = "flex_attention"
  
-dtype=torch.float32
-#dtype=torch.bfloat16
+# dtype=torch.float32
+dtype=torch.bfloat16
 device="xpu"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, attn_implementation=attn_type).to(device)
@@ -28,6 +30,7 @@ prompt = [prompt] * batch_size
 input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 #with torch.no_grad(), torch.autocast(enabled=False if dtype==torch.float32 else True):
 #    model.forward=torch.compile(model.forward)# backend="eager")#, dynamic=True)
+# model.forward=torch.compile(model.forward)# backend="eager")#, dynamic=True)
 generate_kwargs = {
    "do_sample": False,
    "num_beams": 1,
@@ -39,9 +42,33 @@ generate_kwargs = {
 if attn_type == "paged_attention":
    generate_kwargs["past_key_values"] = PagedAttentionCache(100,64)
    
-with torch.no_grad(), torch.autocast(device_type=device, enabled=False if dtype==torch.float32 else True):
+# warmup
+with torch.no_grad(), torch.autocast(device_type=device, enabled=False if dtype==torch.float32 else True, dtype=dtype):
    for i in range(1):
        output=model.generate(input_ids, **generate_kwargs)
        gen_ids = output
        gen_text = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
        print(gen_text)
+
+prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU])
+# prof = contextlib.nullcontext()
+
+# profiler
+with torch.no_grad(), torch.autocast(device_type=device, enabled=False if dtype==torch.float32 else True, dtype=dtype):
+   with prof:
+      for i in range(2):
+         output=model.generate(input_ids, **generate_kwargs)
+         gen_ids = output
+         gen_text = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+         print(gen_text)
+
+if hasattr(prof, "export_chrome_trace"):
+   if torch.cuda.is_available():
+      print(prof.key_averages().table(sort_by="cuda_time_total"))
+   elif torch.xpu.is_available():
+      print(prof.key_averages().table(sort_by="xpu_time_total"))
+   else:
+      print(prof.key_averages().table(sort_by="cpu_time_total"))
+   name = "ut_profiler-new-xpu-compile.json"
+   chrome_trace_name = name
+   prof.export_chrome_trace(chrome_trace_name)
